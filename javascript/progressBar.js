@@ -9,7 +9,6 @@ function setRefreshInterval() {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) refreshInterval = Math.max(2500, opts.live_preview_refresh_period || 1000);
     else refreshInterval = opts.live_preview_refresh_period || 1000;
-    // log('refreshInterval', document.visibilityState, refreshInterval);
   });
 }
 
@@ -80,8 +79,11 @@ function randomId() {
   return `task(${Math.random().toString(36).slice(2, 7)}${Math.random().toString(36).slice(2, 7)}${Math.random().toString(36).slice(2, 7)})`;
 }
 
-// starts sending progress requests to "/internal/progress" uri, creating progressbar above progressbarContainer element and preview inside gallery element
-// Cleans up all created stuff when the task is over and calls atEnd. calls onProgress every time there is a progress update
+function getWebSocketUrl() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/ws/preview`;
+}
+
 function requestProgress(id_task = 'undefined', progressEl = null, galleryEl = null, atEnd = null, onProgress = null, once = false) {
   if (id_task) localStorage.setItem('task', id_task);
   let hasStarted = false;
@@ -90,16 +92,20 @@ function requestProgress(id_task = 'undefined', progressEl = null, galleryEl = n
   const parentGallery = galleryEl ? galleryEl.parentNode : null;
   let livePreview;
   let img;
+  let ws;
+  let wsReconnect;
+  let pollingTimer;
+  let id_live_preview = 0;
 
   const initLivePreview = () => {
     if (!parentGallery) return;
-    const footers = Array.from(gradioApp().querySelectorAll('.gallery_footer'));
+    const footers = gradioApp().querySelectorAll('.gallery_footer');
     for (const footer of footers) {
-      if (footer.id !== 'gallery_footer') footer.style.display = 'none'; // remove all footers
+      if (footer.id !== 'gallery_footer') footer.style.display = 'none';
     }
-    const galleries = Array.from(gradioApp().querySelectorAll('.gallery_main'));
+    const galleries = gradioApp().querySelectorAll('.gallery_main');
     for (const gallery of galleries) {
-      if (gallery.id !== 'gallery_gallery') gallery.style.display = 'none'; // remove all footers
+      if (gallery.id !== 'gallery_gallery') gallery.style.display = 'none';
     }
 
     livePreview = document.createElement('div');
@@ -120,50 +126,114 @@ function requestProgress(id_task = 'undefined', progressEl = null, galleryEl = n
     debug('taskEnd:', id_task);
     localStorage.removeItem('task');
     setProgress();
-    const footers = Array.from(gradioApp().querySelectorAll('.gallery_footer'));
-    for (const footer of footers) footer.style.display = 'flex'; // restore all footers
-    const galleries = Array.from(gradioApp().querySelectorAll('.gallery_main'));
-    for (const gallery of galleries) gallery.style.display = 'flex'; // remove all galleries
-    try {
-      if (parentGallery && livePreview) {
-        if (ok) {
-          const previewImg = gradioApp().querySelector('#livePreviewImage');
-          const galleryImg = gradioApp().querySelector('#control_gallery img');
-          if (previewImg?.src && galleryImg) galleryImg.src = previewImg.src; // copy preview to gallery if everything is ok
-        }
-        parentGallery.removeChild(livePreview);
-        parentGallery.style.minHeight = 'unset';
-        parentGallery.style.maxHeight = 'unset';
-        parentGallery.style.overflow = 'unset';
+    if (ws) {
+      try { ws.send('end'); } catch { /* ignore */ }
+      try { ws.close(); } catch { /* ignore */ }
+      ws = null;
+    }
+    if (wsReconnect) {
+      clearTimeout(wsReconnect);
+      wsReconnect = null;
+    }
+    if (pollingTimer) {
+      clearTimeout(pollingTimer);
+      pollingTimer = null;
+    }
+    const footers = gradioApp().querySelectorAll('.gallery_footer');
+    for (const footer of footers) footer.style.display = 'flex';
+    const galleries = gradioApp().querySelectorAll('.gallery_main');
+    for (const gallery of galleries) gallery.style.display = 'flex';
+    if (parentGallery && livePreview && livePreview.parentNode) {
+      if (ok) {
+        const previewImg = gradioApp().querySelector('#livePreviewImage');
+        const galleryImg = gradioApp().querySelector('#control_gallery img');
+        if (previewImg?.src && galleryImg) galleryImg.src = previewImg.src;
       }
-    } catch { /* ignore */ }
+      parentGallery.removeChild(livePreview);
+      parentGallery.style.minHeight = 'unset';
+      parentGallery.style.maxHeight = 'unset';
+      parentGallery.style.overflow = 'unset';
+    }
     checkPaused(true);
     sendNotification();
     if (atEnd) atEnd();
   };
 
-  const startLivePreview = (id_task, id_live_preview) => { // eslint-disable-line no-shadow
-    if (opts.live_preview_refresh_period === 0) return;
-    const request_id = document.hidden ? -1 : id_live_preview;
+  const onWsMessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.type === 'preview' && data.live_preview) {
+        if (!livePreview) initLivePreview();
+        if (livePreview && galleryEl && img && img.src !== data.live_preview) {
+          img.src = data.live_preview;
+          id_live_preview = data.id_live_preview;
+          lastState = { ...lastState, step: data.step, steps: data.steps, progress: data.progress, job: data.job };
+          setProgress(lastState);
+          if (onProgress) onProgress(lastState);
+          dateStart = new Date();
+          prevProgress = data.progress;
+        }
+      } else if (data.type === 'progress') {
+        lastState = { ...lastState, step: data.step, steps: data.steps, progress: data.progress, active: data.active, paused: data.paused, job: data.job };
+        setProgress(lastState);
+        if (data.progress !== prevProgress) {
+          dateStart = new Date();
+          prevProgress = data.progress;
+        }
+        if (onProgress) onProgress(lastState);
+      } else if (data.type === 'complete') {
+        removeLivePreview(true);
+      }
+    } catch { /* ignore */ }
+  };
 
+  const connectWebSocket = () => {
+    if (ws) return;
+    try {
+      ws = new WebSocket(getWebSocketUrl());
+      ws.onmessage = onWsMessage;
+      ws.onopen = () => {
+        debug('ws', 'connected');
+        if (wsReconnect) {
+          clearTimeout(wsReconnect);
+          wsReconnect = null;
+        }
+      };
+      ws.onclose = () => {
+        debug('ws', 'disconnected');
+        ws = null;
+        if (pollingTimer) {
+          wsReconnect = setTimeout(connectWebSocket, 3000);
+        }
+      };
+      ws.onerror = () => {
+        debug('ws', 'error');
+      };
+    } catch {
+      wsReconnect = setTimeout(connectWebSocket, 3000);
+    }
+  };
+
+  const pollProgress = () => {
+    if (opts.live_preview_refresh_period === 0) return;
     const onProgressHandler = (res) => {
-      if (res?.debug) debug('progress:', { start: dateStart, id: request_id, res });
+      if (res?.debug) debug('progress:', { start: dateStart, res });
       lastState = res;
       const elapsedFromStart = (new Date() - dateStart) / 1000;
       hasStarted |= res.active;
       if (res.completed || (!res.active && (hasStarted || once))) {
         debug('progress', { end: res, reason: res.completed ? 'completed' : 'inactive' });
-        if (!res.paused) removeLivePreview(true); // only abort if not paused
+        if (!res.paused) removeLivePreview(true);
         return;
       }
       if (elapsedFromStart > progressTimeout && !res.queued && res.progress === prevProgress) {
-        debug('progress', { end: res, reason: 'progressSimeout' });
-        if (!res.paused) removeLivePreview(false); // only abort if not paused
+        debug('progress', { end: res, reason: 'progressTimeout' });
+        if (!res.paused) removeLivePreview(false);
         return;
       }
       if (elapsedFromStart > startTimeout && !res.queued && !res.active) {
         debug('progress', { end: res, reason: 'startTimeout' });
-        if (!res.paused) removeLivePreview(false); // only abort if not paused
+        if (!res.paused) removeLivePreview(false);
         return;
       }
       if (res.progress !== prevProgress) {
@@ -171,13 +241,8 @@ function requestProgress(id_task = 'undefined', progressEl = null, galleryEl = n
         prevProgress = res.progress;
       }
       setProgress(res);
-      if (res.live_preview && !livePreview) initLivePreview();
-      if (res.live_preview && galleryEl) {
-        if (img.src !== res.live_preview) img.src = res.live_preview;
-        id_live_preview = res.id_live_preview;
-      }
       if (onProgress) onProgress(res);
-      setTimeout(() => startLivePreview(id_task, id_live_preview), opts.live_preview_refresh_period || 500);
+      pollingTimer = setTimeout(pollProgress, opts.live_preview_refresh_period || 500);
     };
 
     const onProgressErrorHandler = (err) => {
@@ -185,8 +250,10 @@ function requestProgress(id_task = 'undefined', progressEl = null, galleryEl = n
       removeLivePreview(false);
     };
 
-    xhrPost('./internal/progress', { id_task, id_live_preview: request_id }, onProgressHandler, onProgressErrorHandler, false, 30000);
+    xhrPost('./internal/progress', { id_task, id_live_preview: -1 }, onProgressHandler, onProgressErrorHandler, false, 30000);
   };
+
   debug('progress', { start: dateStart });
-  startLivePreview(id_task, 0);
+  connectWebSocket();
+  pollProgress();
 }
